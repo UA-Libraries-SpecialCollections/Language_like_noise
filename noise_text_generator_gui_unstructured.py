@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# Uses Python 3.10 :  C:\Python310>python.exe "S:\Digital Projects\Dev\language_like_noise_text_gen\noise_text_generator_gui.py"
+# Uses Python 3.10 :  C:\Python310>python.exe "S:\Digital Projects\Dev\language_like_noise_text_gen\noise_text_generator_gui_unstructured.py"
 # Developed by the University of Alabama Libraries Digital Services unit
 # Jeremiah Colonna-Romano 2026 jjcolonnaromano@ua.edu
 
@@ -15,7 +15,7 @@ procedurally generated parts of speech dictionaries
 Zipfian word reuse distribution for parts of speech
 Entity term strings model NL frequencies
 procedurally generated string "words"
-Unstructured noise mode (random characters / punctuation / whitespace)
+Unstructured character noise mode
 
 custom filenaming output options
 Optionaly generate JSON settings file during export for dataset reproducibility / transparency
@@ -223,9 +223,9 @@ class ZipfSampler:
 @dataclass
 class NoiseTextConfig:
     # dataset
-    num_files: int = 25
-    sentences_min: int = 8
-    sentences_max: int = 16
+    num_files: int = 250
+    sentences_min: int = 100
+    sentences_max: int = 250
     words_min: int = 12
     words_max: int = 20
 
@@ -236,9 +236,21 @@ class NoiseTextConfig:
     word_len_max: int = 12
 
     # generator mode
-    generator_mode: str = "syllable"  # "syllable" | "letterfreq" | "uniform"
+    generator_mode: str = "syllable"  # "syllable" | "letterfreq" | "uniform" | "unstructured"
     uniform_alphabet: str = "abcdefghijklmnopqrstuvwxyz"
     allow_double_letters: bool = True
+
+    # unstructured mode (non-language-like stream)
+    unstructured_min_chars: int = 2500
+    unstructured_max_chars: int = 8000
+    unstructured_pool: str = string.ascii_letters + string.digits + string.punctuation
+    unstructured_weight_alnum: float = 0.4
+    unstructured_weight_punct: float = 0.3
+    unstructured_weight_space: float = 0.1
+    unstructured_weight_newline: float = 0.1
+    unstructured_max_run: int = 4
+    unstructured_allow_tabs: bool = False
+    unstructured_tab_weight: float = 0.02
 
     # syllable settings
     syllables_min: int = 1
@@ -287,6 +299,7 @@ class NoiseTextConfig:
 
     # JSON settings sidecar
     export_settings_json: bool = True
+    
     settings_filename: str = f"dataset_settings_{seed}_{date_val}.json"
     include_file_list_in_json: bool = True
     include_vocab_in_json: bool = False  # can be large if enabled
@@ -300,7 +313,7 @@ class NoiseTextGenerator:
         self.lex: Dict[str, ZipfSampler] = {}
         self._derived_sizes: Dict[str, int] = {}
 
-        if cfg.enable_zipf_reuse:
+        if cfg.enable_zipf_reuse and cfg.generator_mode != "unstructured":
             self._init_zipf_lexicons()
 
     # ----- base word creation -----
@@ -422,6 +435,7 @@ class NoiseTextGenerator:
     def _build_vocab(self, pos: str, size: int, title_case: bool = False) -> List[str]:
         vocab: set[str] = set()
         attempts = 0
+        # avoid infinite loops if constraints are too tight
         max_attempts = max(2000, size * 60)
 
         while len(vocab) < size and attempts < max_attempts:
@@ -429,6 +443,7 @@ class NoiseTextGenerator:
             tok = self._make_pos_token(pos)
             if title_case:
                 tok = maybe_capitalize(tok, "title")
+            # basic cleanliness
             if tok and " " not in tok and "\n" not in tok and "\t" not in tok:
                 vocab.add(tok)
 
@@ -444,6 +459,7 @@ class NoiseTextGenerator:
         attempts = 0
         max_attempts = max(2000, size * 80)
 
+        # Bias entity length slightly toward 2 words if possible
         def sample_len() -> int:
             lo, hi = cfg.entity_tokens_min, cfg.entity_tokens_max
             lo = max(1, int(lo))
@@ -511,6 +527,7 @@ class NoiseTextGenerator:
             return words
 
         protect_after = protect_after or [False] * len(words)
+        # Insert comma after word i (0-index i). Avoid first/last and protected positions.
         valid = [i for i in range(1, len(words) - 1) if not protect_after[i]]
         if not valid:
             return words
@@ -527,6 +544,11 @@ class NoiseTextGenerator:
     # ----- sentence generation: POS-like Zipf mode -----
 
     def _next_pos(self, prev: str) -> str:
+        """
+        Simple POS-ish Markov transitions to make output look grammatical-ish.
+        Returns next POS, or "END".
+        """
+        # Base transition table
         T: Dict[str, List[Tuple[str, float]]] = {
             "START": [("DET", 0.40), ("PRON", 0.16), ("NOUN", 0.22), ("ADJ", 0.10), ("ENTITY", 0.12)],
             "DET":   [("ADJ", 0.38), ("NOUN", 0.52), ("ENTITY", 0.10)],
@@ -546,8 +568,10 @@ class NoiseTextGenerator:
         return weighted_choice(items, weights)
 
     def _zipf_token_for_pos(self, pos: str) -> str:
+        # Safety fallback in case lexicons weren't initialized
         if pos in self.lex:
             return self.lex[pos].sample()
+        # Fallback to base word generation (non-zipf)
         wl = sample_word_length(self.cfg.word_len_mean, self.cfg.word_len_stdev, self.cfg.word_len_min, self.cfg.word_len_max)
         return self._base_word(wl)
 
@@ -556,8 +580,9 @@ class NoiseTextGenerator:
         target_words = random.randint(cfg.words_min, cfg.words_max)
 
         words: List[str] = []
-        protect_after: List[bool] = []
+        protect_after: List[bool] = []  # True => avoid comma after this token
 
+        # Optionally force entity at start
         prev = "START"
         if random.random() < cfg.entity_sentence_start_rate:
             phrase = self._zipf_token_for_pos("ENTITY")
@@ -567,7 +592,8 @@ class NoiseTextGenerator:
                 protect_after.append(j < len(parts) - 1)
             prev = "ENTITY"
 
-        max_soft = cfg.words_max + 8
+        # Generate until we hit target, then try to stop at a reasonable boundary
+        max_soft = cfg.words_max + 8  # allow a little overshoot to land on an "endable" POS
         last_pos = prev
 
         while len(words) < target_words:
@@ -576,8 +602,10 @@ class NoiseTextGenerator:
             if pos == "END":
                 if len(words) >= cfg.words_min:
                     break
+                # If too short, keep going with a noun-ish continuation
                 pos = "NOUN"
 
+            # Replace some noun slots with entities
             if pos == "NOUN" and random.random() < cfg.entity_replace_noun_rate:
                 pos = "ENTITY"
 
@@ -594,6 +622,7 @@ class NoiseTextGenerator:
                 protect_after.append(False)
                 last_pos = pos
 
+        # Try to end on a sensible POS if we're still in an awkward state
         endable = {"NOUN", "VERB", "ADV", "ENTITY"}
         while len(words) < max_soft and last_pos not in endable:
             pos = self._next_pos(last_pos)
@@ -615,10 +644,12 @@ class NoiseTextGenerator:
                 protect_after.append(False)
                 last_pos = pos
 
+        # Hard trim if way too long
         if len(words) > max_soft:
             words = words[:max_soft]
             protect_after = protect_after[:max_soft]
 
+        # Extra casing noise on non-entity tokens
         def is_entity_token(w: str) -> bool:
             return bool(w) and w[0].isupper()
 
@@ -633,6 +664,7 @@ class NoiseTextGenerator:
         words = self._maybe_insert_commas(words, protect_after=protect_after)
 
         if cfg.capitalize_sentence_start and words:
+            # Only title-case if not already entity/proper
             words[0] = maybe_capitalize(words[0], "title")
 
         punct = self._sentence_end_punct()
@@ -668,11 +700,81 @@ class NoiseTextGenerator:
         if self.cfg.enable_zipf_reuse:
             return self.generate_sentence_zipf()
         return self.generate_sentence_random()
-
     # ----- document generation -----
+
+    def generate_unstructured_document(self) -> str:
+        """Generate a non-language-like stream of characters, punctuation, and whitespace."""
+        cfg = self.cfg
+        lo = max(0, int(cfg.unstructured_min_chars))
+        hi = max(lo, int(cfg.unstructured_max_chars))
+        target = random.randint(lo, hi) if hi > lo else lo
+
+        # Pool provided by user is for non-whitespace; whitespace/newlines are inserted separately.
+        pool = "".join(ch for ch in (cfg.unstructured_pool or "") if ch.isprintable() and not ch.isspace())
+        if not pool:
+            pool = string.ascii_letters + string.digits + string.punctuation
+
+        alnum_pool = "".join(ch for ch in pool if ch.isalnum()) or (string.ascii_letters + string.digits)
+        punct_pool = "".join(ch for ch in pool if not ch.isalnum()) or string.punctuation
+
+        labels = ["alnum", "punct", "space", "newline"]
+        weights = [
+            max(0.0, float(cfg.unstructured_weight_alnum)),
+            max(0.0, float(cfg.unstructured_weight_punct)),
+            max(0.0, float(cfg.unstructured_weight_space)),
+            max(0.0, float(cfg.unstructured_weight_newline)),
+        ]
+
+        # Optional tabs
+        if cfg.unstructured_allow_tabs and float(cfg.unstructured_tab_weight) > 0:
+            labels.append("tab")
+            weights.append(max(0.0, float(cfg.unstructured_tab_weight)))
+
+        if sum(weights) <= 0:
+            # fallback: mostly alnum with some punctuation and spaces
+            labels = ["alnum", "punct", "space", "newline"]
+            weights = [0.62, 0.18, 0.16, 0.04]
+
+        max_run = max(1, int(cfg.unstructured_max_run))
+
+        out: List[str] = []
+        n = 0
+        while n < target:
+            kind = weighted_choice(labels, weights)
+
+            if kind == "alnum":
+                run = random.randint(1, min(max_run, 32))
+                chunk = "".join(random.choice(alnum_pool) for _ in range(run))
+            elif kind == "punct":
+                run = random.randint(1, min(max_run, 16))
+                chunk = "".join(random.choice(punct_pool) for _ in range(run))
+            elif kind == "space":
+                run = random.randint(1, min(max_run, 12))
+                chunk = " " * run
+            elif kind == "newline":
+                # bias toward single newlines but allow some doubles
+                run = 1 if random.random() < 0.78 else 2
+                chunk = "\n" * run
+            else:  # tab
+                run = 1 if random.random() < 0.85 else 2
+                chunk = "\t" * run
+
+            remaining = target - n
+            if len(chunk) > remaining:
+                chunk = chunk[:remaining]
+            out.append(chunk)
+            n += len(chunk)
+
+        s = "".join(out)
+        if not s.endswith("\n"):
+            s += "\n"
+        return s
 
     def generate_document(self) -> str:
         cfg = self.cfg
+        if cfg.generator_mode == "unstructured":
+            return self.generate_unstructured_document()
+
         n_sentences = random.randint(cfg.sentences_min, cfg.sentences_max)
         sentences = [self.generate_sentence() for _ in range(n_sentences)]
 
@@ -687,7 +789,6 @@ class NoiseTextGenerator:
             out_lines.append(" ".join(chunk))
             idx += block
         return "\n\n".join(out_lines) + "\n"
-
 
 # ------------------------------- GUI helpers -------------------------------
 
@@ -771,7 +872,7 @@ class RangeRow(ttk.Frame):
 # --------------------------------- The app ---------------------------------
 
 class App(ttk.Frame):
-    TOOL_VERSION = "1.1"
+    TOOL_VERSION = "1.2"
 
     def __init__(self, master: tk.Tk):
         super().__init__(master)
@@ -794,6 +895,7 @@ class App(ttk.Frame):
         paned.grid(row=0, column=0, sticky="nsew")
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
+
 
         # Left panel becomes scrollable because the number of settings can exceed screen height.
         left_container = ttk.Frame(paned)
@@ -909,13 +1011,18 @@ class App(ttk.Frame):
             modes, text="Uniform random letters", variable=self.gen_mode, value="uniform",
             command=self._on_mode_change
         ).grid(row=2, column=1, sticky="w")
+        ttk.Radiobutton(
+            modes, text="Unstructured (random chars/punct/spaces)", variable=self.gen_mode, value="unstructured",
+            command=self._on_mode_change
+        ).grid(row=3, column=1, sticky="w")
         modes.grid(row=0, column=0, sticky="w", pady=(0, 6))
 
         self.cb_allow_double = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        self.w_allow_double = ttk.Checkbutton(
             g_gen, text="Allow doubled letters (e.g., 'tt')", variable=self.cb_allow_double,
             command=self._update_preview
-        ).grid(row=1, column=0, sticky="w", pady=4)
+        )
+        self.w_allow_double.grid(row=1, column=0, sticky="w", pady=4)
 
         self.r_syllables = RangeRow(g_gen, "Syllables per word", width=8)
         self.r_syllables.grid(row=2, column=0, sticky="w", pady=4)
@@ -923,25 +1030,70 @@ class App(ttk.Frame):
         self.e_alphabet = LabeledEntry(g_gen, "Alphabet (uniform mode)", width=30)
         self.e_alphabet.grid(row=3, column=0, sticky="w", pady=4)
 
+
+
+        # Unstructured mode group (non-language-like output)
+        g_unstruct = ttk.Labelframe(left, text="Unstructured noise mode", padding=10)
+        g_unstruct.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        g_unstruct.grid_columnconfigure(0, weight=1)
+
+        ttk.Label(
+            g_unstruct,
+            text="Generates unpredictable streams of characters/punctuation/spaces (ignores sentence/word settings).",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        self.r_un_chars = RangeRow(g_unstruct, "Characters per file", width=8)
+        self.r_un_chars.grid(row=1, column=0, sticky="w", pady=4)
+
+        self.e_un_pool = LabeledEntry(g_unstruct, "Char pool (non-whitespace)", width=36)
+        self.e_un_pool.grid(row=2, column=0, sticky="w", pady=4)
+
+        wrow = ttk.Frame(g_unstruct)
+        ttk.Label(wrow, text="Category weights").grid(row=0, column=0, sticky="w", columnspan=8, pady=(0, 4))
+        self.e_un_w_alnum = LabeledEntry(wrow, "alnum", width=8)
+        self.e_un_w_punct = LabeledEntry(wrow, "punct", width=8)
+        self.e_un_w_space = LabeledEntry(wrow, "space", width=8)
+        self.e_un_w_newline = LabeledEntry(wrow, "newline", width=8)
+        self.e_un_w_alnum.grid(row=1, column=0, sticky="w", padx=(0, 10))
+        self.e_un_w_punct.grid(row=1, column=1, sticky="w", padx=(0, 10))
+        self.e_un_w_space.grid(row=1, column=2, sticky="w", padx=(0, 10))
+        self.e_un_w_newline.grid(row=1, column=3, sticky="w")
+        wrow.grid(row=3, column=0, sticky="w", pady=6)
+
+        self.e_un_max_run = LabeledEntry(g_unstruct, "Max run length", width=10)
+        self.e_un_max_run.grid(row=4, column=0, sticky="w", pady=4)
+
+        self.cb_un_tabs = tk.BooleanVar(value=False)
+        self.w_un_tabs = ttk.Checkbutton(
+            g_unstruct, text="Allow TAB characters (\t) as whitespace", variable=self.cb_un_tabs,
+            command=self._on_mode_change
+        )
+        self.w_un_tabs.grid(row=5, column=0, sticky="w", pady=(6, 4))
+
+        self.e_un_tab_weight = LabeledEntry(g_unstruct, "Tab weight (if enabled)", width=10)
+        self.e_un_tab_weight.grid(row=6, column=0, sticky="w", pady=4)
+
         # Zipf group
         g_zipf = ttk.Labelframe(left, text="Zipf-like reuse, POS lexicons & entities", padding=10)
-        g_zipf.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        g_zipf.grid(row=4, column=0, sticky="ew", pady=(0, 10))
         g_zipf.grid_columnconfigure(0, weight=1)
 
         self.cb_zipf = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        self.w_zipf_enable = ttk.Checkbutton(
             g_zipf, text="Enable Zipf-like word reuse (more natural repetition)",
             variable=self.cb_zipf, command=self._on_zipf_toggle
-        ).grid(row=0, column=0, sticky="w", pady=4)
+        )
+        self.w_zipf_enable.grid(row=0, column=0, sticky="w", pady=4)
 
         self.e_zipf_exp = LabeledEntry(g_zipf, "Zipf exponent (≈ 1.0)", width=10)
         self.e_zipf_exp.grid(row=1, column=0, sticky="w", pady=4)
 
         self.cb_pos_suffix = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        self.w_pos_suffix = ttk.Checkbutton(
             g_zipf, text="Add POS-like suffixes (e.g., -ly, -ing) in lexicons",
             variable=self.cb_pos_suffix, command=self._update_preview
-        ).grid(row=2, column=0, sticky="w", pady=4)
+        )
+        self.w_pos_suffix.grid(row=2, column=0, sticky="w", pady=4)
 
         self.e_func_vocab = LabeledEntry(g_zipf, "Function vocab size (DET/PREP/CONJ/PRON)", width=10)
         self.e_cont_vocab = LabeledEntry(g_zipf, "Content vocab size (NOUN/VERB/ADJ/ADV)", width=10)
@@ -960,14 +1112,15 @@ class App(ttk.Frame):
 
         # Styling group
         g_style = ttk.Labelframe(left, text="Sentence styling", padding=10)
-        g_style.grid(row=4, column=0, sticky="ew", pady=(0, 10))
+        g_style.grid(row=5, column=0, sticky="ew", pady=(0, 10))
         g_style.grid_columnconfigure(0, weight=1)
 
         self.cb_cap_start = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        self.w_cap_start = ttk.Checkbutton(
             g_style, text="Capitalize first word of each sentence", variable=self.cb_cap_start,
             command=self._update_preview
-        ).grid(row=0, column=0, sticky="w", pady=4)
+        )
+        self.w_cap_start.grid(row=0, column=0, sticky="w", pady=4)
 
         self.e_proper_rate = LabeledEntry(g_style, "Extra Title-Case word rate (0..1)", width=10)
         self.e_caps_rate = LabeledEntry(g_style, "ALL-CAPS word rate (0..1)", width=10)
@@ -976,7 +1129,7 @@ class App(ttk.Frame):
 
         # Punctuation group
         g_punct = ttk.Labelframe(left, text="Punctuation & paragraphs", padding=10)
-        g_punct.grid(row=5, column=0, sticky="ew", pady=(0, 10))
+        g_punct.grid(row=6, column=0, sticky="ew", pady=(0, 10))
         g_punct.grid_columnconfigure(0, weight=1)
 
         self.e_comma_rate = LabeledEntry(g_punct, "Comma insertion rate (0..1)", width=10)
@@ -995,16 +1148,17 @@ class App(ttk.Frame):
         g_end.grid(row=2, column=0, sticky="w", pady=6)
 
         self.cb_paras = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        self.w_paras = ttk.Checkbutton(
             g_punct, text="Enable paragraph breaks", variable=self.cb_paras,
             command=self._update_preview
-        ).grid(row=3, column=0, sticky="w", pady=4)
+        )
+        self.w_paras.grid(row=3, column=0, sticky="w", pady=4)
         self.r_para_every = RangeRow(g_punct, "Paragraph break every N sentences", width=8)
         self.r_para_every.grid(row=4, column=0, sticky="w", pady=4)
 
         # Output group
         g_out = ttk.Labelframe(left, text="Output settings", padding=10)
-        g_out.grid(row=6, column=0, sticky="ew", pady=(0, 10))
+        g_out.grid(row=7, column=0, sticky="ew", pady=(0, 10))
         g_out.grid_columnconfigure(0, weight=1)
 
         self.out_dir = tk.StringVar(value="C:/temp")
@@ -1035,6 +1189,7 @@ class App(ttk.Frame):
             row=7, column=0, sticky="w", pady=(6, 4)
         )
 
+        # JSON sidecar controls
         self.cb_export_json = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             g_out, text="Export JSON settings sidecar", variable=self.cb_export_json
@@ -1050,7 +1205,7 @@ class App(ttk.Frame):
 
         self.cb_json_vocab = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            g_out, text="Include vocabularies in JSON (makes large settings files)", variable=self.cb_json_vocab
+            g_out, text="Include vocabularies in JSON (can be large)", variable=self.cb_json_vocab
         ).grid(row=11, column=0, sticky="w", pady=4)
 
         # Buttons
@@ -1058,7 +1213,7 @@ class App(ttk.Frame):
         ttk.Button(btns, text="Preview sample", command=self._update_preview).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(btns, text="Generate files", command=self._generate_files).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(btns, text="Reset defaults", command=self._reset_defaults).grid(row=0, column=2)
-        btns.grid(row=7, column=0, sticky="w", pady=(4, 0))
+        btns.grid(row=8, column=0, sticky="w", pady=(4, 0))
 
         # ---- RIGHT: Preview + log
         right.grid_rowconfigure(1, weight=1)
@@ -1075,6 +1230,7 @@ class App(ttk.Frame):
         self.log.grid(row=3, column=0, sticky="nsew", pady=(6, 0))
         right.grid_rowconfigure(3, weight=1)
 
+        # Live preview updates on most text variables losing focus
         watched = [
             self.e_num_files.entry, self.r_sentences.min_entry, self.r_sentences.max_entry,
             self.r_words.min_entry, self.r_words.max_entry,
@@ -1082,6 +1238,12 @@ class App(ttk.Frame):
             self.r_wordlen_bounds.min_entry, self.r_wordlen_bounds.max_entry,
             self.r_syllables.min_entry, self.r_syllables.max_entry,
             self.e_alphabet.entry,
+
+            self.r_un_chars.min_entry, self.r_un_chars.max_entry,
+            self.e_un_pool.entry,
+            self.e_un_w_alnum.entry, self.e_un_w_punct.entry, self.e_un_w_space.entry, self.e_un_w_newline.entry,
+            self.e_un_max_run.entry,
+            self.e_un_tab_weight.entry,
 
             self.e_zipf_exp.entry, self.e_func_vocab.entry, self.e_cont_vocab.entry, self.e_ent_vocab.entry,
             self.r_ent_len.min_entry, self.r_ent_len.max_entry,
@@ -1131,6 +1293,16 @@ class App(ttk.Frame):
         self.r_syllables.set(c.syllables_min, c.syllables_max)
         self.e_alphabet.set(c.uniform_alphabet)
 
+        self.r_un_chars.set(c.unstructured_min_chars, c.unstructured_max_chars)
+        self.e_un_pool.set(c.unstructured_pool)
+        self.e_un_w_alnum.set(c.unstructured_weight_alnum)
+        self.e_un_w_punct.set(c.unstructured_weight_punct)
+        self.e_un_w_space.set(c.unstructured_weight_space)
+        self.e_un_w_newline.set(c.unstructured_weight_newline)
+        self.e_un_max_run.set(c.unstructured_max_run)
+        self.cb_un_tabs.set(c.unstructured_allow_tabs)
+        self.e_un_tab_weight.set(c.unstructured_tab_weight)
+
         self.cb_zipf.set(c.enable_zipf_reuse)
         self.e_zipf_exp.set(c.zipf_exponent)
         self.cb_pos_suffix.set(c.pos_like_suffixes)
@@ -1173,25 +1345,85 @@ class App(ttk.Frame):
         self._on_mode_change()
         self._on_zipf_toggle()
 
+    
+
     def _on_mode_change(self) -> None:
-        mode = self.gen_mode.get()
-        if mode == "uniform":
+        mode = self.gen_mode.get().strip()
+        is_unstructured = mode == "unstructured"
+
+        # Base word generator controls
+        if mode == "uniform" and not is_unstructured:
             self.e_alphabet.entry.configure(state="normal")
         else:
             self.e_alphabet.entry.configure(state="disabled")
 
-        if mode == "syllable":
+        if mode == "syllable" and not is_unstructured:
             self.r_syllables.min_entry.configure(state="normal")
             self.r_syllables.max_entry.configure(state="normal")
         else:
             self.r_syllables.min_entry.configure(state="disabled")
             self.r_syllables.max_entry.configure(state="disabled")
 
-        self._update_preview()
+        self.w_allow_double.configure(state="disabled" if is_unstructured else "normal")
+
+        # Language-like settings are irrelevant in unstructured mode
+        lang_state = "disabled" if is_unstructured else "normal"
+        for w in [
+            self.r_sentences.min_entry, self.r_sentences.max_entry,
+            self.r_words.min_entry, self.r_words.max_entry,
+            self.e_word_mean.entry, self.e_word_sd.entry,
+            self.r_wordlen_bounds.min_entry, self.r_wordlen_bounds.max_entry,
+            self.w_cap_start, self.e_proper_rate.entry, self.e_caps_rate.entry,
+            self.e_comma_rate.entry, self.e_max_commas.entry,
+            self.e_w_period.entry, self.e_w_q.entry, self.e_w_ex.entry,
+            self.w_paras, self.r_para_every.min_entry, self.r_para_every.max_entry,
+        ]:
+            try:
+                w.configure(state=lang_state)
+            except Exception:
+                pass
+
+        # Unstructured controls
+        un_state = "normal" if is_unstructured else "disabled"
+        for w in [
+            self.r_un_chars.min_entry, self.r_un_chars.max_entry,
+            self.e_un_pool.entry,
+            self.e_un_w_alnum.entry, self.e_un_w_punct.entry, self.e_un_w_space.entry, self.e_un_w_newline.entry,
+            self.e_un_max_run.entry,
+            self.w_un_tabs,
+        ]:
+            try:
+                w.configure(state=un_state)
+            except Exception:
+                pass
+
+        # Tab weight is only meaningful when tabs are enabled (and we're in unstructured mode)
+        if is_unstructured and bool(self.cb_un_tabs.get()):
+            self.e_un_tab_weight.entry.configure(state="normal")
+        else:
+            self.e_un_tab_weight.entry.configure(state="disabled")
+
+        # Zipf controls depend on mode too (also triggers preview update)
+        self._on_zipf_toggle()
 
     def _on_zipf_toggle(self) -> None:
-        enabled = bool(self.cb_zipf.get())
-        state = "normal" if enabled else "disabled"
+        mode = self.gen_mode.get().strip()
+        is_unstructured = mode == "unstructured"
+
+        if is_unstructured:
+            try:
+                self.w_zipf_enable.configure(state="disabled")
+            except Exception:
+                pass
+            state = "disabled"
+        else:
+            try:
+                self.w_zipf_enable.configure(state="normal")
+            except Exception:
+                pass
+            enabled = bool(self.cb_zipf.get())
+            state = "normal" if enabled else "disabled"
+
         for w in [
             self.e_zipf_exp.entry,
             self.e_func_vocab.entry, self.e_cont_vocab.entry, self.e_ent_vocab.entry,
@@ -1199,6 +1431,12 @@ class App(ttk.Frame):
             self.e_ent_start_rate.entry, self.e_ent_noun_rate.entry,
         ]:
             w.configure(state=state)
+
+        # POS suffixes are irrelevant in unstructured mode
+        try:
+            self.w_pos_suffix.configure(state="disabled" if is_unstructured else "normal")
+        except Exception:
+            pass
 
         self._update_preview()
 
@@ -1210,21 +1448,47 @@ class App(ttk.Frame):
             ext = "." + ext
         return ext
 
+    
     def _read_cfg_from_ui(self) -> NoiseTextConfig:
         c = NoiseTextConfig()
 
         c.num_files = self.e_num_files.get_int(min_value=1, max_value=1_000_000)
-        c.sentences_min, c.sentences_max = self.r_sentences.get_int_range(min_value=1, max_value=1_000_000)
-        c.words_min, c.words_max = self.r_words.get_int_range(min_value=1, max_value=1_000_000)
-
-        c.word_len_mean = self.e_word_mean.get_float(min_value=1.0, max_value=200.0)
-        c.word_len_stdev = self.e_word_sd.get_float(min_value=0.0, max_value=200.0)
-        c.word_len_min, c.word_len_max = self.r_wordlen_bounds.get_int_range(min_value=1, max_value=500)
-
         c.generator_mode = self.gen_mode.get().strip()
-        c.allow_double_letters = bool(self.cb_allow_double.get())
-        c.syllables_min, c.syllables_max = self.r_syllables.get_int_range(min_value=1, max_value=20)
-        c.uniform_alphabet = self.e_alphabet.get_str().strip() or "abcdefghijklmnopqrstuvwxyz"
+
+        if c.generator_mode != "unstructured":
+            c.sentences_min, c.sentences_max = self.r_sentences.get_int_range(min_value=1, max_value=1_000_000)
+            c.words_min, c.words_max = self.r_words.get_int_range(min_value=1, max_value=1_000_000)
+
+            c.word_len_mean = self.e_word_mean.get_float(min_value=1.0, max_value=200.0)
+            c.word_len_stdev = self.e_word_sd.get_float(min_value=0.0, max_value=200.0)
+            c.word_len_min, c.word_len_max = self.r_wordlen_bounds.get_int_range(min_value=1, max_value=500)
+
+            c.allow_double_letters = bool(self.cb_allow_double.get())
+            c.syllables_min, c.syllables_max = self.r_syllables.get_int_range(min_value=1, max_value=20)
+            c.uniform_alphabet = self.e_alphabet.get_str().strip() or "abcdefghijklmnopqrstuvwxyz"
+        else:
+            # These language-like settings are ignored in unstructured mode; keep safe placeholders.
+            c.sentences_min = c.sentences_max = 1
+            c.words_min = c.words_max = 1
+            c.word_len_mean = 4.7
+            c.word_len_stdev = 1.8
+            c.word_len_min = 2
+            c.word_len_max = 12
+            c.allow_double_letters = False
+            c.syllables_min = 1
+            c.syllables_max = 4
+            c.uniform_alphabet = "abcdefghijklmnopqrstuvwxyz"
+
+        if c.generator_mode == "unstructured":
+            c.unstructured_min_chars, c.unstructured_max_chars = self.r_un_chars.get_int_range(min_value=0, max_value=50_000_000)
+            c.unstructured_pool = self.e_un_pool.get_str()
+            c.unstructured_weight_alnum = self.e_un_w_alnum.get_float(min_value=0.0, max_value=1_000_000.0)
+            c.unstructured_weight_punct = self.e_un_w_punct.get_float(min_value=0.0, max_value=1_000_000.0)
+            c.unstructured_weight_space = self.e_un_w_space.get_float(min_value=0.0, max_value=1_000_000.0)
+            c.unstructured_weight_newline = self.e_un_w_newline.get_float(min_value=0.0, max_value=1_000_000.0)
+            c.unstructured_max_run = self.e_un_max_run.get_int(min_value=1, max_value=1_000_000)
+            c.unstructured_allow_tabs = bool(self.cb_un_tabs.get())
+            c.unstructured_tab_weight = self.e_un_tab_weight.get_float(min_value=0.0, max_value=1_000_000.0)
 
         c.enable_zipf_reuse = bool(self.cb_zipf.get())
         c.zipf_exponent = self.e_zipf_exp.get_float(min_value=0.2, max_value=5.0)
@@ -1267,20 +1531,53 @@ class App(ttk.Frame):
         c.include_file_list_in_json = bool(self.cb_json_filelist.get())
         c.include_vocab_in_json = bool(self.cb_json_vocab.get())
 
-        if c.word_len_min > c.word_len_max:
-            raise ValueError("Word length bounds are invalid.")
-        if c.word_len_mean < c.word_len_min or c.word_len_mean > c.word_len_max:
-            raise ValueError("Average word length should fall within the word length bounds.")
-        if c.generator_mode not in {"syllable", "letterfreq", "uniform"}:
+        # Additional checks
+        if c.generator_mode not in {"syllable", "letterfreq", "uniform", "unstructured"}:
             raise ValueError("Generator mode is invalid.")
-        if c.syllables_min > c.syllables_max:
-            raise ValueError("Syllables per word bounds are invalid.")
 
+        # Skip language-like validation when generating unstructured streams.
+        if c.generator_mode != "unstructured":
+            if c.word_len_min > c.word_len_max:
+                raise ValueError("Word length bounds are invalid.")
+            if c.word_len_mean < c.word_len_min or c.word_len_mean > c.word_len_max:
+                raise ValueError("Average word length should fall within the word length bounds.")
+            if c.syllables_min > c.syllables_max:
+                raise ValueError("Syllables per word bounds are invalid.")
+
+        # Uniform alphabet sanity
         if c.generator_mode == "uniform":
             cleaned = "".join(ch for ch in c.uniform_alphabet if ch.isprintable() and not ch.isspace())
             if len(cleaned) < 2:
                 raise ValueError("Alphabet must contain at least 2 printable non-space characters.")
             c.uniform_alphabet = cleaned
+
+
+        if c.generator_mode == "unstructured":
+            # In unstructured mode we explicitly ignore language-like lexicons.
+            c.enable_zipf_reuse = False
+
+            if c.unstructured_max_chars <= 0:
+                raise ValueError("Unstructured max characters must be > 0.")
+
+            cleaned_pool = "".join(ch for ch in (c.unstructured_pool or "") if ch.isprintable() and not ch.isspace())
+            if not cleaned_pool:
+                raise ValueError("Unstructured char pool must contain at least 1 printable non-space character.")
+            c.unstructured_pool = cleaned_pool
+
+            weights = [
+                max(0.0, float(c.unstructured_weight_alnum)),
+                max(0.0, float(c.unstructured_weight_punct)),
+                max(0.0, float(c.unstructured_weight_space)),
+                max(0.0, float(c.unstructured_weight_newline)),
+            ]
+            if c.unstructured_allow_tabs and float(c.unstructured_tab_weight) > 0:
+                weights.append(max(0.0, float(c.unstructured_tab_weight)))
+
+            if sum(weights) <= 0:
+                raise ValueError("Unstructured weights must include at least one positive value.")
+
+            if c.unstructured_max_run < 1:
+                raise ValueError("Unstructured max run length must be ≥ 1.")
 
         return c
 
@@ -1302,6 +1599,7 @@ class App(ttk.Frame):
             self._log(f"[Preview error] {e}")
 
     def _next_available_path(self, path: Path) -> Path:
+        """If path exists, append _1, _2, ... before the suffix."""
         if not path.exists():
             return path
         stem = path.stem
@@ -1370,6 +1668,7 @@ class App(ttk.Frame):
             created_files.append(fname)
             written += 1
 
+        # Write JSON sidecar
         if cfg.export_settings_json:
             settings_path = out / cfg.settings_filename
             if settings_path.exists() and not cfg.overwrite_existing:
@@ -1390,6 +1689,7 @@ class App(ttk.Frame):
                 payload["generated_files"] = created_files
 
             if cfg.include_vocab_in_json and cfg.enable_zipf_reuse:
+                # Note: can be large.
                 payload["vocabularies"] = {k: gen.lex[k].vocab() for k in sorted(gen.lex.keys())}
 
             try:
