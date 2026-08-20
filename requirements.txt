@@ -1,0 +1,20 @@
+# Noise Text Dataset Builder v1.4.2
+# Full-feature reviewer environment for the source-declared Python 3.10 target.
+#
+# The GUI and core generators use the Python standard library. Tkinter is not
+# installed through pip; on some Linux systems install the OS package
+# separately (for example: sudo apt install python3-tk).
+#
+# These pins provide:
+#   - NumPy arrays/cosine operations used by the SBERT path
+#   - actual TF-IDF and cosine similarity rather than the built-in fallback
+#   - fuzzy near-duplicate filtering
+#   - optional SBERT scoring with all-MiniLM-L6-v2
+#
+# sentence-transformers installs its own PyTorch/Transformers dependencies.
+# GPU-specific PyTorch installations may require platform-specific instructions.
+
+numpy==2.2.6
+scikit-learn==1.7.2
+RapidFuzz==3.14.5
+sentence-transformers==5.7.0
